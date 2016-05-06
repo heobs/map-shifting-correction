@@ -26,37 +26,14 @@ import StringIO
 import argparse
 import codecs
 import contextlib
-import enum
-import locale
 import os
-import sys
 import zipfile
 
-# Python determines the encoding of stdout and stderr based on the
-# value of the ``LC_CTYPE`` variable, but only if the stdout is a tty.
-# So if you just output to the terminal, ``LC_CTYPE`` (or ``LC_ALL``)
-# define the encoding.  However, when the output is piped to a file or
-# to a different process, the encoding is not defined, and defaults to
-# 7-bit ASCII, which raise the following exception when outputting
-# unicode characters:
-#
-#   ``UnicodeEncodeError: 'ascii' codec can't encode character u'\x..' in position 18: ordinal not in range(128).``
-#
-# @note: using the environment variable ``PYTHONIOENCODING`` is
-#     another solution, however it requires the user to prefix the
-#     command line with ``PYTHONIOENCODING=utf-8``, which is more
-#     cumbersome.
-# sys.stdout = codecs.getwriter(sys.stdout.encoding if sys.stdout.isatty() \
-#         else locale.getpreferredencoding())(sys.stdout)
+# Define the KML geometries currently supported by this script.
+SUPPORTED_KML_GEOMETRIES = [ 'Point', 'Polygon', 'LineString' ]
 
 
 class Place(object):
-    GeometryType = enum.Enum(
-        'line',
-        'point',
-        'polygon',
-    )
-
     def __init__(self, name, type, geometry):
         self.name = name
         self.type = type
@@ -70,7 +47,7 @@ class Place(object):
         if self.name != other.name or self.type != other.type:
             return False
 
-        if self.type == Place.GeometryType.point:
+        if self.type == 'Point':
             return (round(self.geometry.longitude - other.geometry.longitude, 8),
                     round(self.geometry.latitude - other.geometry.latitude, 8))
 
@@ -85,32 +62,41 @@ class Place(object):
 
 
 def find_map_shifting(original_document, modified_document):
-    found = False
+    """
+    Return the geographical shift of one geometry element of the modified
+    document compared to the location of this element in the original
+    document.
 
+
+    @param original_document: a KML document.
+
+    @param modified_document: a copy of the KML document where the
+        location of one geometry has been manually fixed.
+
+
+    @return: a tuple ``(longitude, latitude)`` corresponding to the
+        geographical shift of the particular element found.
+    """
+    shift = None
     for original_element in original_elements:
         for modified_element in modified_elements:
             _shift_ = original_element.calculate_shift(modified_element)
             if _shift_ and _shift_ != (0.0, 0.0):
-                if found:
-                    print '[ERROR] More than one geometry has been modified!'
-                    return None
-                else:
-                    shift = _shift_
-                    print '[INFO] Place %s has been moved %s from its initial position' % (original_element.name, shift)
-                    found = True
+                assert not shift, 'More than one geometry has been modified!'
+                shift = _shift_
 
-    if not found:
-        print '[ERROR] No change has been noticed!'
+    assert shift, 'No change has been noticed!'
 
-    else:
-        return shift
+    return shift
 
 
 def open_kml_file(file_path_name):
     """
     Open the specified KML or KMZ file and return an XML document.
 
+
     @param file_path_name: absolute path and name of a KML or KMZ file.
+
 
     @return: an XML document.
     """
@@ -165,66 +151,55 @@ def parse_kml_elements(root_element):
         name_element = children.get('name')
         place_name = name_element.childNodes[0].nodeValue.strip() if len(name_element.childNodes) > 0 else None
 
-        # Retrieve the geometry of this place, either a simple point, either a
-        # polygon.
-        if children.get('Point'):
-            (longitude, latitude, altitude) = children['Point'].getElementsByTagName('coordinates')[0].childNodes[0].nodeValue.split(',')
-            place = Place(place_name, Place.GeometryType.point,
-                    GeoPoint(round(longitude, 8), round(latitude, 8), altitude=round(altitude, 8)))
+        # Retrieve the geometry of this place.
+        geometry_type = [_ for _ in SUPPORTED_KML_GEOMETRIES if children.get(_)]
+        if geometry_type:
+            geometry_type = geometry_type[0]
+            geometry_coordinates_element =  children[geometry_type].getElementsByTagName('coordinates')[0].childNodes[0]
 
-        elif children.get('Polygon'):
-            place_geometry = [ GeoPoint(round(float(lon), 8), round(float(lat), 8), round(float(alt), 8)) for (lon, lat, alt) in
-                    [ coordinates.split(',') for coordinates in
-                            children['Polygon'].getElementsByTagName('coordinates')[0].childNodes[0].nodeValue.split(' ') ]]
-            place = Place(place_name, Place.GeometryType.polygon, place_geometry)
+            geometry = [ GeoPoint(round(float(longitude), 8), round(float(latitude), 8), round(float(altitude), 8))
+                    for (longitude, latitude, altitude) in[ coordinates.split(',') for coordinates in
+                        geometry_coordinates_element.nodeValue.split(' ')]]
 
-        elif children.get('LineString'):
-            place_geometry = [ GeoPoint(round(float(lon), 8), round(float(lat), 8), round(float(alt), 8)) for (lon, lat, alt) in
-                    [ coordinates.split(',') for coordinates in
-                            children['LineString'].getElementsByTagName('coordinates')[0].childNodes[0].nodeValue.split(' ') ]]
-            place = Place(place_name, Place.GeometryType.line, place_geometry)
-
-        elif children.get('styleUrl'):
-            pass # Ignore Style URL?
-
-        else:
-            print '[WARNING] Ignore place "%s" with unsupported geometry.' % place_name
-            print children.items()
-            continue
-
-        places.append(place)
+            place = Place(place_name, geometry_type, geometry)
+            places.append(place)
 
     return places
 
 
-def shift_kml_document(document, (shift_x, shift_y)):
+def shift_kml_document(document, shift):
+    """
+    Apply the shift to every geometry element of the specified KML document.
+
+
+    @param document: a KML document
+
+    @param shift: a tuple ``(longitude, latitude)`` representing the
+        geographical shift to apply to every geometry element of the KML
+        document.
+
+
+    @return: the specified KML document.
+    """
+    (shift_x, shift_y) = shift
+
     for element in document.getElementsByTagName('Placemark'):
         children = dict([ (child.nodeName, child) for child in element.childNodes ])
 
-        if children.get('Point'):
-            (longitude, latitude, altitude) = \
-                children['Point'].getElementsByTagName('coordinates')[0].childNodes[0].nodeValue.split(',')
+        geometry_type = [ _ for _ in SUPPORTED_KML_GEOMETRIES if children.get(_) ]
+        if geometry_type:
+            geometry_type = geometry_type[0]
+            geometry_coordinates_element = children[geometry_type].getElementsByTagName('coordinates')[0].childNodes[0]
 
-            children['Point'].getElementsByTagName('coordinates')[0].childNodes[0].nodeValue = '%s,%s,%s' % \
-                    (round(float(longitude) - shift_x, 8), round(float(latitude) - shift_y, 8), altitude)
-
-        elif children.get('Polygon'):
             geometry = [ (float(longitude), float(latitude), float(altitude))
                     for (longitude, latitude, altitude) in [ coordinates.split(',')
-                            for coordinates in children['Polygon'].getElementsByTagName('coordinates')[0].childNodes[0].nodeValue.split(' ') ]]
+                            for coordinates in geometry_coordinates_element.nodeValue.split(' ') ]]
 
-            children['Polygon'].getElementsByTagName('coordinates')[0].firstChild.replaceWholeText(
+            geometry_coordinates_element.replaceWholeText(
                     ' '.join([ '%s,%s,%s' % (round(longitude - shift_x, 8), round(latitude - shift_y, 8), altitude)
                             for (longitude, latitude, altitude) in geometry ]))
 
-        elif children.get('LineString'):
-            geometry = [ (float(longitude), float(latitude), float(altitude))
-                    for (longitude, latitude, altitude) in [ coordinates.split(',')
-                            for coordinates in children['LineString'].getElementsByTagName('coordinates')[0].childNodes[0].nodeValue.split(' ') ]]
-
-            children['LineString'].getElementsByTagName('coordinates')[0].firstChild.nodeValue = \
-                    ' '.join([ '%s,%s,%s' % (round(longitude - shift_x, 8), round(latitude - shift_y, 8), altitude)
-                            for (longitude, latitude, altitude) in geometry ])
+    return document
 
 
 if __name__ == "__main__":
@@ -247,11 +222,14 @@ if __name__ == "__main__":
     shift = find_map_shifting(original_elements, modified_elements)
     (shift_x, shift_y) = shift
 
-    shift_kml_document(original_xml_document, shift)
+    fixed_xml_document = shift_kml_document(original_xml_document, shift)
 
-    output_file_path_name = arguments.output_file_path_name if arguments.output_file_path_name else \
-            os.path.join(os.path.dirname(arguments.original_file_path_name),
-                         'fixed_%s' % os.path.basename(arguments.original_file_path_name))
+    if arguments.output_file_path_name is None:
+        print fixed_xml_document.toxml()
 
-    with contextlib.closing(codecs.open(output_file_path_name, 'wt', encoding='utf-8')) as file_handle:
-        original_xml_document.writexml(file_handle)
+    else:
+        (_, file_extension) = os.path.splitext(arguments.output_file_path_name)
+        assert file_extension.lower() != 'kml', 'Wrong output file extension; need to be KML or KMZ'
+
+        with contextlib.closing(codecs.open(arguments.output_file_path_name, 'wt', encoding='utf-8')) as file_handle:
+            original_xml_document.writexml(file_handle)
